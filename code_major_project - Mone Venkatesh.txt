@@ -1,0 +1,2870 @@
+mnistZyNet.py:
+
+from zynet import zynet
+from zynet import utils
+import numpy as np
+
+def genMnistZynet(dataWidth,sigmoidSize,weightIntSize,inputIntSize):
+    model = zynet.model()
+    model.add(zynet.layer("flatten",784))
+    model.add(zynet.layer("Dense",30,"sigmoid"))
+    model.add(zynet.layer("Dense",30,"sigmoid"))
+    model.add(zynet.layer("Dense",10,"sigmoid"))
+    model.add(zynet.layer("Dense",10,"sigmoid"))
+    model.add(zynet.layer("Dense",10,"hardmax"))
+    weightArray = utils.genWeightArray('WeigntsAndBiases.txt')
+    biasArray = utils.genBiasArray('WeigntsAndBiases.txt')
+    model.compile(pretrained='Yes',weights=weightArray,biases=biasArray,dataWidth=dataWidth,weightIntSize=weightIntSize,inputIntSize=inputIntSize,sigmoidSize=sigmoidSize)
+    zynet.makeXilinxProject('Reconfigurable_Neural_Network_Sigmoid_FPGA','xc7z020clg484-1')
+    zynet.makeIP('Reconfigurable_Neural_Network_Sigmoid_FPGA')
+    zynet.makeSystem('Reconfigurable_Neural_Network_Sigmoid_FPGA','myBlock2')
+    
+if __name__ == "__main__":
+    genMnistZynet(dataWidth=8,sigmoidSize=10,weightIntSize=4,inputIntSize=1)
+	
+	
+	
+	
+genWegitsAndBias.py:
+
+import json
+
+dataWidth = 16
+dataIntWidth = 1
+weightIntWidth = 4
+inputFile = "WeigntsAndBiases.txt"
+dataFracWidth = dataWidth-dataIntWidth
+weightFracWidth = dataWidth-weightIntWidth
+biasIntWidth = dataIntWidth+weightIntWidth
+biasFracWidth = dataWidth-biasIntWidth
+outputPath = "./w_b/"
+headerPath = "./"
+
+def DtoB(num,dataWidth,fracBits):						#funtion for converting into two's complement format
+	if num >= 0:
+		num = num * (2**fracBits)
+		num = int(num)
+		d = num
+	else:
+		num = -num
+		num = num * (2**fracBits)		#number of fractional bits
+		num = int(num)
+		if num == 0:
+			d = 0
+		else:
+			d = 2**dataWidth - num
+	return d
+
+def genWaitAndBias(dataWidth,weightFracWidth,biasFracWidth,inputFile):
+	weightIntWidth = dataWidth-weightFracWidth
+	biasIntWidth = dataWidth-biasFracWidth
+	myDataFile = open(inputFile,"r")
+	weightHeaderFile = open(headerPath+"weightValues.h","w")
+	myData = myDataFile.read()
+	myDict = json.loads(myData)
+	myWeights = myDict['weights']
+	myBiases = myDict['biases']
+	weightHeaderFile.write("int weightValues[]={")
+	for layer in range(0,len(myWeights)):
+		for neuron in range(0,len(myWeights[layer])):
+			fi = 'w_'+str(layer+1)+'_'+str(neuron)+'.mif'
+			f = open(outputPath+fi,'w')
+			for weight in range(0,len(myWeights[layer][neuron])):
+				if 'e' in str(myWeights[layer][neuron][weight]):
+					p = '0'
+				else:
+					if myWeights[layer][neuron][weight] > 2**(weightIntWidth-1):
+						myWeights[layer][neuron][weight] = 2**(weightIntWidth-1)-2**(-weightFracWidth)
+					elif myWeights[layer][neuron][weight] < -2**(weightIntWidth-1):
+						myWeights[layer][neuron][weight] = -2**(weightIntWidth-1)
+					wInDec = DtoB(myWeights[layer][neuron][weight],dataWidth,weightFracWidth)
+					p = bin(wInDec)[2:]
+				f.write(p+'\n')
+				weightHeaderFile.write(str(wInDec)+',')
+			f.close()
+	weightHeaderFile.write('0};\n')
+	weightHeaderFile.close()
+	
+	biasHeaderFile = open(headerPath+"biasValues.h","w")
+	biasHeaderFile.write("int biasValues[]={")
+	for layer in range(0,len(myBiases)):
+		for neuron in range(0,len(myBiases[layer])):
+			fi = 'b_'+str(layer+1)+'_'+str(neuron)+'.mif'
+			p = myBiases[layer][neuron][0]
+			if 'e' in str(p): #To remove very small values with exponents
+				res = '0'
+			else:
+				if p > 2**(biasIntWidth-1):
+					p = 2**(biasIntWidth-1)-2**(-biasFracWidth)
+				elif p < -2**(biasIntWidth-1):
+					p = -2**(biasIntWidth-1)
+				bInDec = DtoB(p,dataWidth,biasFracWidth)
+				res = bin(bInDec)[2:]
+			f = open(outputPath+fi,'w')
+			f.write(res)
+			biasHeaderFile.write(str(bInDec)+',')
+			f.close()
+	biasHeaderFile.write('0};\n')
+	biasHeaderFile.close()
+			
+if __name__ == "__main__":
+	genWaitAndBias(dataWidth,weightFracWidth,biasFracWidth,inputFile)
+	
+	
+zynet.v:
+
+`include "include.v"
+
+module zyNet #(
+    parameter integer C_S_AXI_DATA_WIDTH    = 32,
+    parameter integer C_S_AXI_ADDR_WIDTH    = 5
+)
+(
+    //Clock and Reset
+    input                                   s_axi_aclk,
+    input                                   s_axi_aresetn,
+    //AXI Stream interface
+    input [`dataWidth-1:0]                  axis_in_data,
+    input                                   axis_in_data_valid,
+    output                                  axis_in_data_ready,
+    //AXI Lite Interface
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0]   s_axi_awaddr,
+    input wire [2 : 0]                      s_axi_awprot,
+    input wire                              s_axi_awvalid,
+    output wire                             s_axi_awready,
+    input wire [C_S_AXI_DATA_WIDTH-1 : 0]   s_axi_wdata,
+    input wire [(C_S_AXI_DATA_WIDTH/8)-1 : 0] s_axi_wstrb,
+    input wire                              s_axi_wvalid,
+    output wire                             s_axi_wready,
+    output wire [1 : 0]                     s_axi_bresp,
+    output wire                             s_axi_bvalid,
+    input wire                              s_axi_bready,
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0]   s_axi_araddr,
+    input wire [2 : 0]                      s_axi_arprot,
+    input wire                              s_axi_arvalid,
+    output wire                             s_axi_arready,
+    output wire [C_S_AXI_DATA_WIDTH-1 : 0]  s_axi_rdata,
+    output wire [1 : 0]                     s_axi_rresp,
+    output wire                             s_axi_rvalid,
+    input wire                              s_axi_rready,
+    //Interrupt interface
+    output wire                             intr
+);
+
+
+wire [31:0]  config_layer_num;
+wire [31:0]  config_neuron_num;
+wire [31:0] weightValue;
+wire [31:0] biasValue;
+wire [31:0] out;
+wire out_valid;
+wire weightValid;
+wire biasValid;
+wire axi_rd_en;
+wire [31:0] axi_rd_data;
+wire softReset;
+
+assign intr = out_valid;
+assign axis_in_data_ready = 1'b1;
+
+
+axi_lite_wrapper # ( 
+    .C_S_AXI_DATA_WIDTH(C_S_AXI_DATA_WIDTH),
+    .C_S_AXI_ADDR_WIDTH(C_S_AXI_ADDR_WIDTH)
+) alw (
+    .S_AXI_ACLK(s_axi_aclk),
+    .S_AXI_ARESETN(s_axi_aresetn),
+    .S_AXI_AWADDR(s_axi_awaddr),
+    .S_AXI_AWPROT(s_axi_awprot),
+    .S_AXI_AWVALID(s_axi_awvalid),
+    .S_AXI_AWREADY(s_axi_awready),
+    .S_AXI_WDATA(s_axi_wdata),
+    .S_AXI_WSTRB(s_axi_wstrb),
+    .S_AXI_WVALID(s_axi_wvalid),
+    .S_AXI_WREADY(s_axi_wready),
+    .S_AXI_BRESP(s_axi_bresp),
+    .S_AXI_BVALID(s_axi_bvalid),
+    .S_AXI_BREADY(s_axi_bready),
+    .S_AXI_ARADDR(s_axi_araddr),
+    .S_AXI_ARPROT(s_axi_arprot),
+    .S_AXI_ARVALID(s_axi_arvalid),
+    .S_AXI_ARREADY(s_axi_arready),
+    .S_AXI_RDATA(s_axi_rdata),
+    .S_AXI_RRESP(s_axi_rresp),
+    .S_AXI_RVALID(s_axi_rvalid),
+    .S_AXI_RREADY(s_axi_rready),
+    .layerNumber(config_layer_num),
+    .neuronNumber(config_neuron_num),
+    .weightValue(weightValue),
+    .weightValid(weightValid),
+    .biasValid(biasValid),
+    .biasValue(biasValue),
+    .nnOut_valid(out_valid),
+    .nnOut(out),
+    .axi_rd_en(axi_rd_en),
+    .axi_rd_data(axi_rd_data),
+    .softReset(softReset)
+);
+
+wire reset;
+
+assign reset = ~s_axi_aresetn|softReset;
+
+localparam IDLE = 'd0,
+           SEND = 'd1;
+wire [`numNeuronLayer1-1:0] o1_valid;
+wire [`numNeuronLayer1*`dataWidth-1:0] x1_out;
+reg [`numNeuronLayer1*`dataWidth-1:0] holdData_1;
+reg [`dataWidth-1:0] out_data_1;
+reg data_out_valid_1;
+
+Layer_1 #(.NN(`numNeuronLayer1),.numWeight(`numWeightLayer1),.dataWidth(`dataWidth),.layerNum(1),.sigmoidSize(`sigmoidSize),.weightIntWidth(`weightIntWidth),.actType(`Layer1ActType)) l1(
+	.clk(s_axi_aclk),
+	.rst(reset),
+	.weightValid(weightValid),
+	.biasValid(biasValid),
+	.weightValue(weightValue),
+	.biasValue(biasValue),
+	.config_layer_num(config_layer_num),
+	.config_neuron_num(config_neuron_num),
+	.x_valid(axis_in_data_valid),
+	.x_in(axis_in_data),
+	.o_valid(o1_valid),
+	.x_out(x1_out)
+);
+
+//State machine for data pipelining
+
+reg       state_1;
+integer   count_1;
+always @(posedge s_axi_aclk)
+begin
+    if(reset)
+    begin
+        state_1 <= IDLE;
+        count_1 <= 0;
+        data_out_valid_1 <=0;
+    end
+    else
+    begin
+        case(state_1)
+            IDLE: begin
+                count_1 <= 0;
+                data_out_valid_1 <=0;
+                if (o1_valid[0] == 1'b1)
+                begin
+                    holdData_1 <= x1_out;
+                    state_1 <= SEND;
+                end
+            end
+            SEND: begin
+                out_data_1 <= holdData_1[`dataWidth-1:0];
+                holdData_1 <= holdData_1>>`dataWidth;
+                count_1 <= count_1 +1;
+                data_out_valid_1 <= 1;
+                if (count_1 == `numNeuronLayer1)
+                begin
+                    state_1 <= IDLE;
+                    data_out_valid_1 <= 0;
+                end
+            end
+        endcase
+    end
+end
+
+wire [`numNeuronLayer2-1:0] o2_valid;
+wire [`numNeuronLayer2*`dataWidth-1:0] x2_out;
+reg [`numNeuronLayer2*`dataWidth-1:0] holdData_2;
+reg [`dataWidth-1:0] out_data_2;
+reg data_out_valid_2;
+
+Layer_2 #(.NN(`numNeuronLayer2),.numWeight(`numWeightLayer2),.dataWidth(`dataWidth),.layerNum(2),.sigmoidSize(`sigmoidSize),.weightIntWidth(`weightIntWidth),.actType(`Layer2ActType)) l2(
+	.clk(s_axi_aclk),
+	.rst(reset),
+	.weightValid(weightValid),
+	.biasValid(biasValid),
+	.weightValue(weightValue),
+	.biasValue(biasValue),
+	.config_layer_num(config_layer_num),
+	.config_neuron_num(config_neuron_num),
+	.x_valid(data_out_valid_1),
+	.x_in(out_data_1),
+	.o_valid(o2_valid),
+	.x_out(x2_out)
+);
+
+//State machine for data pipelining
+
+reg       state_2;
+integer   count_2;
+always @(posedge s_axi_aclk)
+begin
+    if(reset)
+    begin
+        state_2 <= IDLE;
+        count_2 <= 0;
+        data_out_valid_2 <=0;
+    end
+    else
+    begin
+        case(state_2)
+            IDLE: begin
+                count_2 <= 0;
+                data_out_valid_2 <=0;
+                if (o2_valid[0] == 1'b1)
+                begin
+                    holdData_2 <= x2_out;
+                    state_2 <= SEND;
+                end
+            end
+            SEND: begin
+                out_data_2 <= holdData_2[`dataWidth-1:0];
+                holdData_2 <= holdData_2>>`dataWidth;
+                count_2 <= count_2 +1;
+                data_out_valid_2 <= 1;
+                if (count_2 == `numNeuronLayer2)
+                begin
+                    state_2 <= IDLE;
+                    data_out_valid_2 <= 0;
+                end
+            end
+        endcase
+    end
+end
+
+wire [`numNeuronLayer3-1:0] o3_valid;
+wire [`numNeuronLayer3*`dataWidth-1:0] x3_out;
+reg [`numNeuronLayer3*`dataWidth-1:0] holdData_3;
+reg [`dataWidth-1:0] out_data_3;
+reg data_out_valid_3;
+
+Layer_3 #(.NN(`numNeuronLayer3),.numWeight(`numWeightLayer3),.dataWidth(`dataWidth),.layerNum(3),.sigmoidSize(`sigmoidSize),.weightIntWidth(`weightIntWidth),.actType(`Layer3ActType)) l3(
+	.clk(s_axi_aclk),
+	.rst(reset),
+	.weightValid(weightValid),
+	.biasValid(biasValid),
+	.weightValue(weightValue),
+	.biasValue(biasValue),
+	.config_layer_num(config_layer_num),
+	.config_neuron_num(config_neuron_num),
+	.x_valid(data_out_valid_2),
+	.x_in(out_data_2),
+	.o_valid(o3_valid),
+	.x_out(x3_out)
+);
+
+//State machine for data pipelining
+
+reg       state_3;
+integer   count_3;
+always @(posedge s_axi_aclk)
+begin
+    if(reset)
+    begin
+        state_3 <= IDLE;
+        count_3 <= 0;
+        data_out_valid_3 <=0;
+    end
+    else
+    begin
+        case(state_3)
+            IDLE: begin
+                count_3 <= 0;
+                data_out_valid_3 <=0;
+                if (o3_valid[0] == 1'b1)
+                begin
+                    holdData_3 <= x3_out;
+                    state_3 <= SEND;
+                end
+            end
+            SEND: begin
+                out_data_3 <= holdData_3[`dataWidth-1:0];
+                holdData_3 <= holdData_3>>`dataWidth;
+                count_3 <= count_3 +1;
+                data_out_valid_3 <= 1;
+                if (count_3 == `numNeuronLayer3)
+                begin
+                    state_3 <= IDLE;
+                    data_out_valid_3 <= 0;
+                end
+            end
+        endcase
+    end
+end
+
+wire [`numNeuronLayer4-1:0] o4_valid;
+wire [`numNeuronLayer4*`dataWidth-1:0] x4_out;
+reg [`numNeuronLayer4*`dataWidth-1:0] holdData_4;
+reg [`dataWidth-1:0] out_data_4;
+reg data_out_valid_4;
+
+Layer_4 #(.NN(`numNeuronLayer4),.numWeight(`numWeightLayer4),.dataWidth(`dataWidth),.layerNum(4),.sigmoidSize(`sigmoidSize),.weightIntWidth(`weightIntWidth),.actType(`Layer4ActType)) l4(
+	.clk(s_axi_aclk),
+	.rst(reset),
+	.weightValid(weightValid),
+	.biasValid(biasValid),
+	.weightValue(weightValue),
+	.biasValue(biasValue),
+	.config_layer_num(config_layer_num),
+	.config_neuron_num(config_neuron_num),
+	.x_valid(data_out_valid_3),
+	.x_in(out_data_3),
+	.o_valid(o4_valid),
+	.x_out(x4_out)
+);
+
+//State machine for data pipelining
+
+reg       state_4;
+integer   count_4;
+always @(posedge s_axi_aclk)
+begin
+    if(reset)
+    begin
+        state_4 <= IDLE;
+        count_4 <= 0;
+        data_out_valid_4 <=0;
+    end
+    else
+    begin
+        case(state_4)
+            IDLE: begin
+                count_4 <= 0;
+                data_out_valid_4 <=0;
+                if (o4_valid[0] == 1'b1)
+                begin
+                    holdData_4 <= x4_out;
+                    state_4 <= SEND;
+                end
+            end
+            SEND: begin
+                out_data_4 <= holdData_4[`dataWidth-1:0];
+                holdData_4 <= holdData_4>>`dataWidth;
+                count_4 <= count_4 +1;
+                data_out_valid_4 <= 1;
+                if (count_4 == `numNeuronLayer4)
+                begin
+                    state_4 <= IDLE;
+                    data_out_valid_4 <= 0;
+                end
+            end
+        endcase
+    end
+end
+
+reg [`numNeuronLayer4*`dataWidth-1:0] holdData_5;
+assign axi_rd_data = holdData_5[`dataWidth-1:0];
+
+always @(posedge s_axi_aclk)
+    begin
+        if (o4_valid[0] == 1'b1)
+            holdData_5 <= x4_out;
+        else if(axi_rd_en)
+        begin
+            holdData_5 <= holdData_5>>`dataWidth;
+        end
+    end
+
+
+maxFinder #(.numInput(`numNeuronLayer4),.inputWidth(`dataWidth))
+    mFind(
+        .i_clk(s_axi_aclk),
+        .i_data(x4_out),
+        .i_valid(o4_valid),
+        .o_data(out),
+        .o_data_valid(out_valid)
+    );
+endmodule
+
+
+
+axi_lite_wrapper.v:
+
+
+`timescale 1 ns / 1 ps
+
+	module axi_lite_wrapper #
+	(
+		// Users to add parameters here
+
+		// User parameters ends
+		// Do not modify the parameters beyond this line
+
+		// Width of S_AXI data bus
+		parameter integer C_S_AXI_DATA_WIDTH	= 32,
+		// Width of S_AXI address bus
+		parameter integer C_S_AXI_ADDR_WIDTH	= 5
+	)
+	(
+		// Users to add ports here
+
+		// User ports ends
+		// Do not modify the ports beyond this line
+
+		// Global Clock Signal
+		input wire  S_AXI_ACLK,
+		// Global Reset Signal. This Signal is Active LOW
+		input wire  S_AXI_ARESETN,
+		// Write address (issued by master, acceped by Slave)
+		input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_AWADDR,
+		// Write channel Protection type. This signal indicates the
+    		// privilege and security level of the transaction, and whether
+    		// the transaction is a data access or an instruction access.
+		input wire [2 : 0] S_AXI_AWPROT,
+		// Write address valid. This signal indicates that the master signaling
+    		// valid write address and control information.
+		input wire  S_AXI_AWVALID,
+		// Write address ready. This signal indicates that the slave is ready
+    		// to accept an address and associated control signals.
+		output wire  S_AXI_AWREADY,
+		// Write data (issued by master, acceped by Slave) 
+		input wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_WDATA,
+		// Write strobes. This signal indicates which byte lanes hold
+    		// valid data. There is one write strobe bit for each eight
+    		// bits of the write data bus.    
+		input wire [(C_S_AXI_DATA_WIDTH/8)-1 : 0] S_AXI_WSTRB,
+		// Write valid. This signal indicates that valid write
+    		// data and strobes are available.
+		input wire  S_AXI_WVALID,
+		// Write ready. This signal indicates that the slave
+    		// can accept the write data.
+		output wire  S_AXI_WREADY,
+		// Write response. This signal indicates the status
+    		// of the write transaction.
+		output wire [1 : 0] S_AXI_BRESP,
+		// Write response valid. This signal indicates that the channel
+    		// is signaling a valid write response.
+		output wire  S_AXI_BVALID,
+		// Response ready. This signal indicates that the master
+    		// can accept a write response.
+		input wire  S_AXI_BREADY,
+		// Read address (issued by master, acceped by Slave)
+		input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_ARADDR,
+		// Protection type. This signal indicates the privilege
+    		// and security level of the transaction, and whether the
+    		// transaction is a data access or an instruction access.
+		input wire [2 : 0] S_AXI_ARPROT,
+		// Read address valid. This signal indicates that the channel
+    		// is signaling valid read address and control information.
+		input wire  S_AXI_ARVALID,
+		// Read address ready. This signal indicates that the slave is
+    		// ready to accept an address and associated control signals.
+		output wire  S_AXI_ARREADY,
+		// Read data (issued by slave)
+		output wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_RDATA,
+		// Read response. This signal indicates the status of the
+    		// read transfer.
+		output wire [1 : 0] S_AXI_RRESP,
+		// Read valid. This signal indicates that the channel is
+    		// signaling the required read data.
+		output wire  S_AXI_RVALID,
+		// Read ready. This signal indicates that the master can
+    		// accept the read data and response information.
+		input wire  S_AXI_RREADY,
+        ////////////////////////////////////////////////////////
+        output wire     [31:0]  layerNumber,
+        output wire     [31:0]  neuronNumber,
+        output reg              weightValid,
+        output reg              biasValid,
+        output          [31:0]  weightValue,
+        output          [31:0]  biasValue,
+        input           [31:0]  nnOut,
+        input                   nnOut_valid,
+        output reg              axi_rd_en,
+        input           [31:0]  axi_rd_data,
+        output                  softReset
+	);
+
+	// AXI4LITE signals
+	reg [C_S_AXI_ADDR_WIDTH-1 : 0] 	axi_awaddr;
+	reg  	axi_awready;
+	reg  	axi_wready;
+	reg [1 : 0] 	axi_bresp;
+	reg  	axi_bvalid;
+	reg [C_S_AXI_ADDR_WIDTH-1 : 0] 	axi_araddr;
+	reg  	axi_arready;
+	reg [C_S_AXI_DATA_WIDTH-1 : 0] 	axi_rdata;
+	reg [1 : 0] 	axi_rresp;
+	reg  	axi_rvalid;
+
+	// Example-specific design signals
+	// local parameter for addressing 32 bit / 64 bit C_S_AXI_DATA_WIDTH
+	// ADDR_LSB is used for addressing 32/64 bit registers/memories
+	// ADDR_LSB = 2 for 32 bits (n downto 2)
+	// ADDR_LSB = 3 for 64 bits (n downto 3)
+	localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32) + 1;
+	localparam integer OPT_MEM_ADDR_BITS = 2;
+	//----------------------------------------------
+	//-- Signals for user logic register space example
+	//------------------------------------------------
+	//-- Number of Slave Registers 8
+	reg [C_S_AXI_DATA_WIDTH-1:0]	weightReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	biasReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	outputReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	layerReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	neuronReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	statReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	controlReg;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	slv_reg7;
+    
+	wire	 slv_reg_rden;
+	wire	 slv_reg_wren;
+	reg [C_S_AXI_DATA_WIDTH-1:0]	 reg_data_out;
+	integer	 byte_index;
+	reg	 aw_en;
+
+	// I/O Connections assignments
+
+	assign S_AXI_AWREADY	= axi_awready;
+	assign S_AXI_WREADY	= axi_wready;
+	assign S_AXI_BRESP	= axi_bresp;
+	assign S_AXI_BVALID	= axi_bvalid;
+	assign S_AXI_ARREADY	= axi_arready;
+	assign S_AXI_RDATA	= axi_rdata;
+	assign S_AXI_RRESP	= axi_rresp;
+	assign S_AXI_RVALID	= axi_rvalid;
+	// Implement axi_awready generation
+	// axi_awready is asserted for one S_AXI_ACLK clock cycle when both
+	// S_AXI_AWVALID and S_AXI_WVALID are asserted. axi_awready is
+	// de-asserted when reset is low.
+    
+    assign layerNumber = layerReg;
+    assign neuronNumber = neuronReg;
+    assign weightValue = weightReg;
+    assign biasValue = biasReg;
+    assign softReset = controlReg[0];
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_awready <= 1'b0;
+	      aw_en <= 1'b1;
+	    end 
+	  else
+	    begin    
+	      if (~axi_awready && S_AXI_AWVALID && S_AXI_WVALID && aw_en)
+	        begin
+	          // slave is ready to accept write address when 
+	          // there is a valid write address and write data
+	          // on the write address and data bus. This design 
+	          // expects no outstanding transactions. 
+	          axi_awready <= 1'b1;
+	          aw_en <= 1'b0;
+	        end
+	        else if (S_AXI_BREADY && axi_bvalid)
+	            begin
+	              aw_en <= 1'b1;
+	              axi_awready <= 1'b0;
+	            end
+	      else           
+	        begin
+	          axi_awready <= 1'b0;
+	        end
+	    end 
+	end       
+
+	// Implement axi_awaddr latching
+	// This process is used to latch the address when both 
+	// S_AXI_AWVALID and S_AXI_WVALID are valid. 
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_awaddr <= 0;
+	    end 
+	  else
+	    begin    
+	      if (~axi_awready && S_AXI_AWVALID && S_AXI_WVALID && aw_en)
+	        begin
+	          // Write Address latching 
+	          axi_awaddr <= S_AXI_AWADDR;
+	        end
+	    end 
+	end       
+
+	// Implement axi_wready generation
+	// axi_wready is asserted for one S_AXI_ACLK clock cycle when both
+	// S_AXI_AWVALID and S_AXI_WVALID are asserted. axi_wready is 
+	// de-asserted when reset is low. 
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_wready <= 1'b0;
+	    end 
+	  else
+	    begin    
+	      if (~axi_wready && S_AXI_WVALID && S_AXI_AWVALID && aw_en )
+	        begin
+	          // slave is ready to accept write data when 
+	          // there is a valid write address and write data
+	          // on the write address and data bus. This design 
+	          // expects no outstanding transactions. 
+	          axi_wready <= 1'b1;
+	        end
+	      else
+	        begin
+	          axi_wready <= 1'b0;
+	        end
+	    end 
+	end       
+
+	// Implement memory mapped register select and write logic generation
+	// The write data is accepted and written to memory mapped registers when
+	// axi_awready, S_AXI_WVALID, axi_wready and S_AXI_WVALID are asserted. Write strobes are used to
+	// select byte enables of slave registers while writing.
+	// These registers are cleared when reset (active low) is applied.
+	// Slave register write enable is asserted when valid address and data are available
+	// and the slave is ready to accept the write address and write data.
+	assign slv_reg_wren = axi_wready && S_AXI_WVALID && axi_awready && S_AXI_AWVALID;
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	if ( S_AXI_ARESETN == 1'b0 )
+		begin
+		weightReg <= 0;
+		biasReg <= 0;
+		layerReg <= 0;
+		neuronReg <= 0;
+		slv_reg7 <= 0;
+		weightValid <= 1'b0;
+		biasValid <= 1'b0;
+		controlReg <= 0;
+		end 
+	else begin
+		weightValid <= 1'b0;
+		biasValid <= 1'b0;
+		if (slv_reg_wren)
+		begin
+			case ( axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
+			3'h0:begin
+					weightReg <= S_AXI_WDATA;
+					weightValid <= 1'b1;
+			end
+			3'h1:begin
+					biasReg <= S_AXI_WDATA; 
+					biasValid <= 1'b1;
+			end
+			3'h3:
+					layerReg <= S_AXI_WDATA;
+			3'h4:
+					neuronReg <= S_AXI_WDATA;
+			3'h7:
+					controlReg <= S_AXI_WDATA;
+			endcase
+		end
+	end
+	end    
+    
+    always @(posedge S_AXI_ACLK)
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+            outputReg <= 0;
+        else if(nnOut_valid)
+            outputReg <= nnOut;
+    end
+
+	// Implement write response logic generation
+	// The write response and response valid signals are asserted by the slave 
+	// when axi_wready, S_AXI_WVALID, axi_wready and S_AXI_WVALID are asserted.  
+	// This marks the acceptance of address and indicates the status of 
+	// write transaction.
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_bvalid  <= 0;
+	      axi_bresp   <= 2'b0;
+	    end 
+	  else
+	    begin    
+	      if (axi_awready && S_AXI_AWVALID && ~axi_bvalid && axi_wready && S_AXI_WVALID)
+	        begin
+	          // indicates a valid write response is available
+	          axi_bvalid <= 1'b1;
+	          axi_bresp  <= 2'b0; // 'OKAY' response 
+	        end                   // work error responses in future
+	      else
+	        begin
+	          if (S_AXI_BREADY && axi_bvalid) 
+	            //check if bready is asserted while bvalid is high) 
+	            //(there is a possibility that bready is always asserted high)   
+	            begin
+	              axi_bvalid <= 1'b0; 
+	            end  
+	        end
+	    end
+	end   
+
+	// Implement axi_arready generation
+	// axi_arready is asserted for one S_AXI_ACLK clock cycle when
+	// S_AXI_ARVALID is asserted. axi_awready is 
+	// de-asserted when reset (active low) is asserted. 
+	// The read address is also latched when S_AXI_ARVALID is 
+	// asserted. axi_araddr is reset to zero on reset assertion.
+
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_arready <= 1'b0;
+	      axi_araddr  <= 32'b0;
+	    end 
+	  else
+	    begin    
+	      if (~axi_arready && S_AXI_ARVALID)
+	        begin
+	          // indicates that the slave has acceped the valid read address
+	          axi_arready <= 1'b1;
+	          // Read address latching
+	          axi_araddr  <= S_AXI_ARADDR;
+	        end
+	      else
+	        begin
+	          axi_arready <= 1'b0;
+	        end
+	    end 
+	end       
+
+	// Implement axi_arvalid generation
+	// axi_rvalid is asserted for one S_AXI_ACLK clock cycle when both 
+	// S_AXI_ARVALID and axi_arready are asserted. The slave registers 
+	// data are available on the axi_rdata bus at this instance. The 
+	// assertion of axi_rvalid marks the validity of read data on the 
+	// bus and axi_rresp indicates the status of read transaction.axi_rvalid 
+	// is deasserted on reset (active low). axi_rresp and axi_rdata are 
+	// cleared to zero on reset (active low).  
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_rvalid <= 0;
+	      axi_rresp  <= 0;
+	    end 
+	  else
+	    begin    
+	      if (axi_arready && S_AXI_ARVALID && ~axi_rvalid)
+	        begin
+	          // Valid read data is available at the read data bus
+	          axi_rvalid <= 1'b1;
+	          axi_rresp  <= 2'b0; // 'OKAY' response
+	        end   
+	      else if (axi_rvalid && S_AXI_RREADY)
+	        begin
+	          // Read data is accepted by the master
+	          axi_rvalid <= 1'b0;
+	        end                
+	    end
+	end    
+
+	// Implement memory mapped register select and read logic generation
+	// Slave register read enable is asserted when valid address is available
+	// and the slave is ready to accept the read address.
+	assign slv_reg_rden = axi_arready & S_AXI_ARVALID & ~axi_rvalid;
+	always @(*)
+	begin
+	      // Address decoding for reading registers
+	      case ( axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
+	        3'h0   : reg_data_out <= weightReg;
+	        3'h1   : reg_data_out <= biasReg;
+	        3'h2   : reg_data_out <= outputReg;
+	        3'h3   : reg_data_out <= layerReg;
+	        3'h4   : reg_data_out <= neuronReg;
+	        3'h5   : reg_data_out <= axi_rd_data;
+	        3'h6   : reg_data_out <= statReg;
+	        3'h7   : reg_data_out <= controlReg;
+	        default : reg_data_out <= 0;
+	      endcase
+	end
+	
+	
+	always @(posedge S_AXI_ACLK)
+	begin
+	   if ( S_AXI_ARESETN == 1'b0 )
+           statReg <= 1'b0;
+	   else if(nnOut_valid)
+	       statReg <= 1'b1;
+	   else if(axi_rvalid & S_AXI_RREADY & axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB]==3'h6)//read clear status reg
+	       statReg <= 1'b0;
+	end
+	
+	always @(posedge S_AXI_ACLK)
+    begin
+       if(!axi_rd_en & axi_rvalid & S_AXI_RREADY & axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB]==3'h5)
+       begin
+           axi_rd_en <= 1'b1;
+       end
+       else
+           axi_rd_en <= 1'b0;
+    end
+
+	// Output register or memory read data
+	always @( posedge S_AXI_ACLK )
+	begin
+	  if ( S_AXI_ARESETN == 1'b0 )
+	    begin
+	      axi_rdata  <= 0;
+	    end 
+	  else
+	    begin    
+	      // When there is a valid read address (S_AXI_ARVALID) with 
+	      // acceptance of read address by the slave (axi_arready), 
+	      // output the read dada 
+	      if (slv_reg_rden)
+	        begin
+	          axi_rdata <= reg_data_out;     // register read data
+	        end   
+	    end
+	end    
+
+	// Add user logic here
+
+	// User logic ends
+
+	endmodule
+
+
+Layer_1.v:
+
+module Layer_1 #(parameter NN = 30,numWeight=784,dataWidth=16,layerNum=1,sigmoidSize=10,weightIntWidth=4,actType="relu")
+    (
+    input           clk,
+    input           rst,
+    input           weightValid,
+    input           biasValid,
+    input [31:0]    weightValue,
+    input [31:0]    biasValue,
+    input [31:0]    config_layer_num,
+    input [31:0]    config_neuron_num,
+    input           x_valid,
+    input [dataWidth-1:0]    x_in,
+    output [NN-1:0]     o_valid,
+    output [NN*dataWidth-1:0]  x_out
+    );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(0),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_0.mif"),.biasFile("b_1_0.mif"))n_0(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[0*dataWidth+:dataWidth]),
+        .outvalid(o_valid[0])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(1),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_1.mif"),.biasFile("b_1_1.mif"))n_1(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[1*dataWidth+:dataWidth]),
+        .outvalid(o_valid[1])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(2),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_2.mif"),.biasFile("b_1_2.mif"))n_2(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[2*dataWidth+:dataWidth]),
+        .outvalid(o_valid[2])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(3),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_3.mif"),.biasFile("b_1_3.mif"))n_3(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[3*dataWidth+:dataWidth]),
+        .outvalid(o_valid[3])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(4),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_4.mif"),.biasFile("b_1_4.mif"))n_4(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[4*dataWidth+:dataWidth]),
+        .outvalid(o_valid[4])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(5),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_5.mif"),.biasFile("b_1_5.mif"))n_5(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[5*dataWidth+:dataWidth]),
+        .outvalid(o_valid[5])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(6),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_6.mif"),.biasFile("b_1_6.mif"))n_6(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[6*dataWidth+:dataWidth]),
+        .outvalid(o_valid[6])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(7),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_7.mif"),.biasFile("b_1_7.mif"))n_7(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[7*dataWidth+:dataWidth]),
+        .outvalid(o_valid[7])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(8),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_8.mif"),.biasFile("b_1_8.mif"))n_8(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[8*dataWidth+:dataWidth]),
+        .outvalid(o_valid[8])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(9),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_9.mif"),.biasFile("b_1_9.mif"))n_9(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[9*dataWidth+:dataWidth]),
+        .outvalid(o_valid[9])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(10),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_10.mif"),.biasFile("b_1_10.mif"))n_10(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[10*dataWidth+:dataWidth]),
+        .outvalid(o_valid[10])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(11),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_11.mif"),.biasFile("b_1_11.mif"))n_11(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[11*dataWidth+:dataWidth]),
+        .outvalid(o_valid[11])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(12),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_12.mif"),.biasFile("b_1_12.mif"))n_12(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[12*dataWidth+:dataWidth]),
+        .outvalid(o_valid[12])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(13),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_13.mif"),.biasFile("b_1_13.mif"))n_13(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[13*dataWidth+:dataWidth]),
+        .outvalid(o_valid[13])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(14),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_14.mif"),.biasFile("b_1_14.mif"))n_14(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[14*dataWidth+:dataWidth]),
+        .outvalid(o_valid[14])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(15),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_15.mif"),.biasFile("b_1_15.mif"))n_15(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[15*dataWidth+:dataWidth]),
+        .outvalid(o_valid[15])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(16),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_16.mif"),.biasFile("b_1_16.mif"))n_16(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[16*dataWidth+:dataWidth]),
+        .outvalid(o_valid[16])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(17),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_17.mif"),.biasFile("b_1_17.mif"))n_17(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[17*dataWidth+:dataWidth]),
+        .outvalid(o_valid[17])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(18),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_18.mif"),.biasFile("b_1_18.mif"))n_18(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[18*dataWidth+:dataWidth]),
+        .outvalid(o_valid[18])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(19),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_19.mif"),.biasFile("b_1_19.mif"))n_19(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[19*dataWidth+:dataWidth]),
+        .outvalid(o_valid[19])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(20),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_20.mif"),.biasFile("b_1_20.mif"))n_20(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[20*dataWidth+:dataWidth]),
+        .outvalid(o_valid[20])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(21),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_21.mif"),.biasFile("b_1_21.mif"))n_21(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[21*dataWidth+:dataWidth]),
+        .outvalid(o_valid[21])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(22),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_22.mif"),.biasFile("b_1_22.mif"))n_22(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[22*dataWidth+:dataWidth]),
+        .outvalid(o_valid[22])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(23),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_23.mif"),.biasFile("b_1_23.mif"))n_23(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[23*dataWidth+:dataWidth]),
+        .outvalid(o_valid[23])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(24),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_24.mif"),.biasFile("b_1_24.mif"))n_24(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[24*dataWidth+:dataWidth]),
+        .outvalid(o_valid[24])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(25),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_25.mif"),.biasFile("b_1_25.mif"))n_25(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[25*dataWidth+:dataWidth]),
+        .outvalid(o_valid[25])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(26),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_26.mif"),.biasFile("b_1_26.mif"))n_26(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[26*dataWidth+:dataWidth]),
+        .outvalid(o_valid[26])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(27),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_27.mif"),.biasFile("b_1_27.mif"))n_27(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[27*dataWidth+:dataWidth]),
+        .outvalid(o_valid[27])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(28),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_28.mif"),.biasFile("b_1_28.mif"))n_28(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[28*dataWidth+:dataWidth]),
+        .outvalid(o_valid[28])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(29),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_1_29.mif"),.biasFile("b_1_29.mif"))n_29(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[29*dataWidth+:dataWidth]),
+        .outvalid(o_valid[29])
+        );
+endmodule
+
+
+Layer_2.v:
+
+module Layer_2 #(parameter NN = 30,numWeight=784,dataWidth=16,layerNum=1,sigmoidSize=10,weightIntWidth=4,actType="relu")
+    (
+    input           clk,
+    input           rst,
+    input           weightValid,
+    input           biasValid,
+    input [31:0]    weightValue,
+    input [31:0]    biasValue,
+    input [31:0]    config_layer_num,
+    input [31:0]    config_neuron_num,
+    input           x_valid,
+    input [dataWidth-1:0]    x_in,
+    output [NN-1:0]     o_valid,
+    output [NN*dataWidth-1:0]  x_out
+    );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(0),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_0.mif"),.biasFile("b_2_0.mif"))n_0(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[0*dataWidth+:dataWidth]),
+        .outvalid(o_valid[0])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(1),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_1.mif"),.biasFile("b_2_1.mif"))n_1(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[1*dataWidth+:dataWidth]),
+        .outvalid(o_valid[1])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(2),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_2.mif"),.biasFile("b_2_2.mif"))n_2(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[2*dataWidth+:dataWidth]),
+        .outvalid(o_valid[2])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(3),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_3.mif"),.biasFile("b_2_3.mif"))n_3(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[3*dataWidth+:dataWidth]),
+        .outvalid(o_valid[3])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(4),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_4.mif"),.biasFile("b_2_4.mif"))n_4(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[4*dataWidth+:dataWidth]),
+        .outvalid(o_valid[4])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(5),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_5.mif"),.biasFile("b_2_5.mif"))n_5(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[5*dataWidth+:dataWidth]),
+        .outvalid(o_valid[5])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(6),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_6.mif"),.biasFile("b_2_6.mif"))n_6(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[6*dataWidth+:dataWidth]),
+        .outvalid(o_valid[6])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(7),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_7.mif"),.biasFile("b_2_7.mif"))n_7(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[7*dataWidth+:dataWidth]),
+        .outvalid(o_valid[7])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(8),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_8.mif"),.biasFile("b_2_8.mif"))n_8(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[8*dataWidth+:dataWidth]),
+        .outvalid(o_valid[8])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(9),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_9.mif"),.biasFile("b_2_9.mif"))n_9(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[9*dataWidth+:dataWidth]),
+        .outvalid(o_valid[9])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(10),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_10.mif"),.biasFile("b_2_10.mif"))n_10(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[10*dataWidth+:dataWidth]),
+        .outvalid(o_valid[10])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(11),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_11.mif"),.biasFile("b_2_11.mif"))n_11(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[11*dataWidth+:dataWidth]),
+        .outvalid(o_valid[11])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(12),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_12.mif"),.biasFile("b_2_12.mif"))n_12(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[12*dataWidth+:dataWidth]),
+        .outvalid(o_valid[12])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(13),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_13.mif"),.biasFile("b_2_13.mif"))n_13(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[13*dataWidth+:dataWidth]),
+        .outvalid(o_valid[13])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(14),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_14.mif"),.biasFile("b_2_14.mif"))n_14(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[14*dataWidth+:dataWidth]),
+        .outvalid(o_valid[14])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(15),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_15.mif"),.biasFile("b_2_15.mif"))n_15(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[15*dataWidth+:dataWidth]),
+        .outvalid(o_valid[15])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(16),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_16.mif"),.biasFile("b_2_16.mif"))n_16(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[16*dataWidth+:dataWidth]),
+        .outvalid(o_valid[16])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(17),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_17.mif"),.biasFile("b_2_17.mif"))n_17(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[17*dataWidth+:dataWidth]),
+        .outvalid(o_valid[17])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(18),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_18.mif"),.biasFile("b_2_18.mif"))n_18(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[18*dataWidth+:dataWidth]),
+        .outvalid(o_valid[18])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(19),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_19.mif"),.biasFile("b_2_19.mif"))n_19(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[19*dataWidth+:dataWidth]),
+        .outvalid(o_valid[19])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(20),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_20.mif"),.biasFile("b_2_20.mif"))n_20(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[20*dataWidth+:dataWidth]),
+        .outvalid(o_valid[20])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(21),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_21.mif"),.biasFile("b_2_21.mif"))n_21(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[21*dataWidth+:dataWidth]),
+        .outvalid(o_valid[21])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(22),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_22.mif"),.biasFile("b_2_22.mif"))n_22(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[22*dataWidth+:dataWidth]),
+        .outvalid(o_valid[22])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(23),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_23.mif"),.biasFile("b_2_23.mif"))n_23(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[23*dataWidth+:dataWidth]),
+        .outvalid(o_valid[23])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(24),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_24.mif"),.biasFile("b_2_24.mif"))n_24(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[24*dataWidth+:dataWidth]),
+        .outvalid(o_valid[24])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(25),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_25.mif"),.biasFile("b_2_25.mif"))n_25(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[25*dataWidth+:dataWidth]),
+        .outvalid(o_valid[25])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(26),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_26.mif"),.biasFile("b_2_26.mif"))n_26(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[26*dataWidth+:dataWidth]),
+        .outvalid(o_valid[26])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(27),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_27.mif"),.biasFile("b_2_27.mif"))n_27(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[27*dataWidth+:dataWidth]),
+        .outvalid(o_valid[27])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(28),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_28.mif"),.biasFile("b_2_28.mif"))n_28(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[28*dataWidth+:dataWidth]),
+        .outvalid(o_valid[28])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(29),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_2_29.mif"),.biasFile("b_2_29.mif"))n_29(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[29*dataWidth+:dataWidth]),
+        .outvalid(o_valid[29])
+        );
+endmodule
+
+
+Layer_3.v:
+
+module Layer_3 #(parameter NN = 30,numWeight=784,dataWidth=16,layerNum=1,sigmoidSize=10,weightIntWidth=4,actType="relu")
+    (
+    input           clk,
+    input           rst,
+    input           weightValid,
+    input           biasValid,
+    input [31:0]    weightValue,
+    input [31:0]    biasValue,
+    input [31:0]    config_layer_num,
+    input [31:0]    config_neuron_num,
+    input           x_valid,
+    input [dataWidth-1:0]    x_in,
+    output [NN-1:0]     o_valid,
+    output [NN*dataWidth-1:0]  x_out
+    );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(0),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_0.mif"),.biasFile("b_3_0.mif"))n_0(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[0*dataWidth+:dataWidth]),
+        .outvalid(o_valid[0])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(1),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_1.mif"),.biasFile("b_3_1.mif"))n_1(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[1*dataWidth+:dataWidth]),
+        .outvalid(o_valid[1])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(2),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_2.mif"),.biasFile("b_3_2.mif"))n_2(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[2*dataWidth+:dataWidth]),
+        .outvalid(o_valid[2])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(3),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_3.mif"),.biasFile("b_3_3.mif"))n_3(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[3*dataWidth+:dataWidth]),
+        .outvalid(o_valid[3])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(4),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_4.mif"),.biasFile("b_3_4.mif"))n_4(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[4*dataWidth+:dataWidth]),
+        .outvalid(o_valid[4])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(5),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_5.mif"),.biasFile("b_3_5.mif"))n_5(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[5*dataWidth+:dataWidth]),
+        .outvalid(o_valid[5])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(6),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_6.mif"),.biasFile("b_3_6.mif"))n_6(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[6*dataWidth+:dataWidth]),
+        .outvalid(o_valid[6])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(7),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_7.mif"),.biasFile("b_3_7.mif"))n_7(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[7*dataWidth+:dataWidth]),
+        .outvalid(o_valid[7])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(8),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_8.mif"),.biasFile("b_3_8.mif"))n_8(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[8*dataWidth+:dataWidth]),
+        .outvalid(o_valid[8])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(9),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_3_9.mif"),.biasFile("b_3_9.mif"))n_9(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[9*dataWidth+:dataWidth]),
+        .outvalid(o_valid[9])
+        );
+endmodule
+
+
+Layer_4.v:
+
+module Layer_4 #(parameter NN = 30,numWeight=784,dataWidth=16,layerNum=1,sigmoidSize=10,weightIntWidth=4,actType="relu")
+    (
+    input           clk,
+    input           rst,
+    input           weightValid,
+    input           biasValid,
+    input [31:0]    weightValue,
+    input [31:0]    biasValue,
+    input [31:0]    config_layer_num,
+    input [31:0]    config_neuron_num,
+    input           x_valid,
+    input [dataWidth-1:0]    x_in,
+    output [NN-1:0]     o_valid,
+    output [NN*dataWidth-1:0]  x_out
+    );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(0),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_0.mif"),.biasFile("b_4_0.mif"))n_0(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[0*dataWidth+:dataWidth]),
+        .outvalid(o_valid[0])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(1),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_1.mif"),.biasFile("b_4_1.mif"))n_1(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[1*dataWidth+:dataWidth]),
+        .outvalid(o_valid[1])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(2),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_2.mif"),.biasFile("b_4_2.mif"))n_2(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[2*dataWidth+:dataWidth]),
+        .outvalid(o_valid[2])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(3),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_3.mif"),.biasFile("b_4_3.mif"))n_3(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[3*dataWidth+:dataWidth]),
+        .outvalid(o_valid[3])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(4),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_4.mif"),.biasFile("b_4_4.mif"))n_4(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[4*dataWidth+:dataWidth]),
+        .outvalid(o_valid[4])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(5),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_5.mif"),.biasFile("b_4_5.mif"))n_5(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[5*dataWidth+:dataWidth]),
+        .outvalid(o_valid[5])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(6),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_6.mif"),.biasFile("b_4_6.mif"))n_6(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[6*dataWidth+:dataWidth]),
+        .outvalid(o_valid[6])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(7),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_7.mif"),.biasFile("b_4_7.mif"))n_7(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[7*dataWidth+:dataWidth]),
+        .outvalid(o_valid[7])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(8),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_8.mif"),.biasFile("b_4_8.mif"))n_8(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[8*dataWidth+:dataWidth]),
+        .outvalid(o_valid[8])
+        );
+neuron #(.numWeight(numWeight),.layerNo(layerNum),.neuronNo(9),.dataWidth(dataWidth),.sigmoidSize(sigmoidSize),.weightIntWidth(weightIntWidth),.actType(actType),.weightFile("w_4_9.mif"),.biasFile("b_4_9.mif"))n_9(
+        .clk(clk),
+        .rst(rst),
+        .myinput(x_in),
+        .weightValid(weightValid),
+        .biasValid(biasValid),
+        .weightValue(weightValue),
+        .biasValue(biasValue),
+        .config_layer_num(config_layer_num),
+        .config_neuron_num(config_neuron_num),
+        .myinputValid(x_valid),
+        .out(x_out[9*dataWidth+:dataWidth]),
+        .outvalid(o_valid[9])
+        );
+endmodule
+
+
+maxFinder.v:
+
+module maxFinder #(parameter numInput=10,parameter inputWidth=16)(
+input           i_clk,
+input [(numInput*inputWidth)-1:0]   i_data,
+input           i_valid,
+output reg [31:0]o_data,
+output  reg     o_data_valid
+);
+
+reg [inputWidth-1:0] maxValue;
+reg [(numInput*inputWidth)-1:0] inDataBuffer;
+integer counter;
+
+always @(posedge i_clk)
+begin
+    o_data_valid <= 1'b0;
+    if(i_valid)
+    begin
+        maxValue <= i_data[inputWidth-1:0];
+        counter <= 1;
+        inDataBuffer <= i_data;
+        o_data <= 0;
+    end
+    else if(counter == numInput)
+    begin
+        counter <= 0;
+        o_data_valid <= 1'b1;
+    end
+    else if(counter != 0)
+    begin
+        counter <= counter + 1;
+        if(inDataBuffer[counter*inputWidth+:inputWidth] > maxValue)
+        begin
+            maxValue <= inDataBuffer[counter*inputWidth+:inputWidth];
+            o_data <= counter;
+        end
+    end
+end
+
+endmodule
+
+
+neuron.v:
+
+`include "include.v"
+
+module neuron #(parameter layerNo=0,neuronNo=0,numWeight=784,dataWidth=16,sigmoidSize=5,weightIntWidth=1,actType="relu",biasFile="",weightFile="")(
+    input           clk,
+    input           rst,
+    input [dataWidth-1:0]    myinput,
+    input           myinputValid,
+    input           weightValid,
+    input           biasValid,
+    input [31:0]    weightValue,
+    input [31:0]    biasValue,
+    input [31:0]    config_layer_num,
+    input [31:0]    config_neuron_num,
+    output[dataWidth-1:0]    out,
+    output reg      outvalid   
+    );
+    
+    parameter addressWidth = $clog2(numWeight);
+    
+    reg         wen;
+    wire        ren;
+    reg [addressWidth-1:0] w_addr;
+    reg [addressWidth:0]   r_addr;//read address has to reach until numWeight hence width is 1 bit more
+    reg [dataWidth-1:0]  w_in;
+    wire [dataWidth-1:0] w_out;
+    reg [2*dataWidth-1:0]  mul; 
+    reg [2*dataWidth-1:0]  sum;
+    reg [2*dataWidth-1:0]  bias;
+    reg [31:0]    biasReg[0:0];
+    reg         weight_valid;
+    reg         mult_valid;
+    wire        mux_valid;
+    reg         sigValid; 
+    wire [2*dataWidth:0] comboAdd;
+    wire [2*dataWidth:0] BiasAdd;
+    reg  [dataWidth-1:0] myinputd;
+    reg muxValid_d;
+    reg muxValid_f;
+    reg addr=0;
+   //Loading weight values into the momory
+    always @(posedge clk)
+    begin
+        if(rst)
+        begin
+            w_addr <= {addressWidth{1'b1}};
+            wen <=0;
+        end
+        else if(weightValid & (config_layer_num==layerNo) & (config_neuron_num==neuronNo))
+        begin
+            w_in <= weightValue;
+            w_addr <= w_addr + 1;
+            wen <= 1;
+        end
+        else
+            wen <= 0;
+    end
+	
+    assign mux_valid = mult_valid;
+    assign comboAdd = mul + sum;
+    assign BiasAdd = bias + sum;
+    assign ren = myinputValid;
+    
+	`ifdef pretrained
+		initial
+		begin
+			$readmemb(biasFile,biasReg);
+		end
+		always @(posedge clk)
+		begin
+            bias <= {biasReg[addr][dataWidth-1:0],{dataWidth{1'b0}}};
+        end
+	`else
+		always @(posedge clk)
+		begin
+			if(biasValid & (config_layer_num==layerNo) & (config_neuron_num==neuronNo))
+			begin
+				bias <= {biasValue[dataWidth-1:0],{dataWidth{1'b0}}};
+			end
+		end
+	`endif
+    
+    
+    always @(posedge clk)
+    begin
+        if(rst|outvalid)
+            r_addr <= 0;
+        else if(myinputValid)
+            r_addr <= r_addr + 1;
+    end
+    
+    always @(posedge clk)
+    begin
+        mul  <= $signed(myinputd) * $signed(w_out);
+    end
+    
+    
+    always @(posedge clk)
+    begin
+        if(rst|outvalid)
+            sum <= 0;
+        else if((r_addr == numWeight) & muxValid_f)
+        begin
+            if(!bias[2*dataWidth-1] &!sum[2*dataWidth-1] & BiasAdd[2*dataWidth-1]) //If bias and sum are positive and after adding bias to sum, if sign bit becomes 1, saturate
+            begin
+                sum[2*dataWidth-1] <= 1'b0;
+                sum[2*dataWidth-2:0] <= {2*dataWidth-1{1'b1}};
+            end
+            else if(bias[2*dataWidth-1] & sum[2*dataWidth-1] &  !BiasAdd[2*dataWidth-1]) //If bias and sum are negative and after addition if sign bit is 0, saturate
+            begin
+                sum[2*dataWidth-1] <= 1'b1;
+                sum[2*dataWidth-2:0] <= {2*dataWidth-1{1'b0}};
+            end
+            else
+                sum <= BiasAdd; 
+        end
+        else if(mux_valid)
+        begin
+            if(!mul[2*dataWidth-1] & !sum[2*dataWidth-1] & comboAdd[2*dataWidth-1])
+            begin
+                sum[2*dataWidth-1] <= 1'b0;
+                sum[2*dataWidth-2:0] <= {2*dataWidth-1{1'b1}};
+            end
+            else if(mul[2*dataWidth-1] & sum[2*dataWidth-1] & !comboAdd[2*dataWidth-1])
+            begin
+                sum[2*dataWidth-1] <= 1'b1;
+                sum[2*dataWidth-2:0] <= {2*dataWidth-1{1'b0}};
+            end
+            else
+                sum <= comboAdd; 
+        end
+    end
+    
+    always @(posedge clk)
+    begin
+        myinputd <= myinput;
+        weight_valid <= myinputValid;
+        mult_valid <= weight_valid;
+        sigValid <= ((r_addr == numWeight) & muxValid_f) ? 1'b1 : 1'b0;
+        outvalid <= sigValid;
+        muxValid_d <= mux_valid;
+        muxValid_f <= !mux_valid & muxValid_d;
+    end
+    
+    
+    //Instantiation of Memory for Weights
+    Weight_Memory #(.numWeight(numWeight),.neuronNo(neuronNo),.layerNo(layerNo),.addressWidth(addressWidth),.dataWidth(dataWidth),.weightFile(weightFile)) WM(
+        .clk(clk),
+        .wen(wen),
+        .ren(ren),
+        .wadd(w_addr),
+        .radd(r_addr),
+        .win(w_in),
+        .wout(w_out)
+    );
+    
+	generate
+		if(actType == "sigmoid")
+		begin:siginst
+		//Instantiation of ROM for sigmoid
+			Sig_ROM #(.inWidth(sigmoidSize),.dataWidth(dataWidth)) s1(
+			.clk(clk),
+			.x(sum[2*dataWidth-1-:sigmoidSize]),
+			.out(out)
+		);
+		end
+		else
+		begin:ReLUinst
+			ReLU #(.dataWidth(dataWidth),.weightIntWidth(weightIntWidth)) s1 (
+			.clk(clk),
+			.x(sum),
+			.out(out)
+		);
+		end
+	endgenerate
+
+    `ifdef DEBUG
+    always @(posedge clk)
+    begin
+        if(outvalid)
+            $display(neuronNo,,,,"%b",out);
+    end
+    `endif
+endmodule
+
+
+
+Weight_Memory.v:
+
+`include "include.v"
+
+module Weight_Memory #(parameter numWeight = 3, neuronNo=5,layerNo=1,addressWidth=10,dataWidth=16,weightFile="w_1_15.mif") 
+    ( 
+    input clk,
+    input wen,
+    input ren,
+    input [addressWidth-1:0] wadd,
+    input [addressWidth-1:0] radd,
+    input [dataWidth-1:0] win,
+    output reg [dataWidth-1:0] wout);
+    
+    reg [dataWidth-1:0] mem [numWeight-1:0];
+
+    `ifdef pretrained
+        initial
+		begin
+	        $readmemb(weightFile, mem);
+	    end
+	`else
+		always @(posedge clk)
+		begin
+			if (wen)
+			begin
+				mem[wadd] <= win;
+			end
+		end 
+    `endif
+    
+    always @(posedge clk)
+    begin
+        if (ren)
+        begin
+            wout <= mem[radd];
+        end
+    end 
+endmodule
+
+
+
+Sig_ROM.V:
+
+module Sig_ROM #(parameter inWidth=10, dataWidth=16) (
+    input           clk,
+    input   [inWidth-1:0]   x,
+    output  [dataWidth-1:0]  out
+    );
+    
+    reg [dataWidth-1:0] mem [2**inWidth-1:0];
+    reg [inWidth-1:0] y;
+	
+	initial
+	begin
+		$readmemb("sigContent.mif",mem);
+	end
+    
+    always @(posedge clk)
+    begin
+        if($signed(x) >= 0)
+            y <= x+(2**(inWidth-1));
+        else 
+            y <= x-(2**(inWidth-1));      
+    end
+    
+    assign out = mem[y];
+    
+endmodule
+
+
+
+relu.v:
+
+module ReLU  #(parameter dataWidth=16,weightIntWidth=4) (
+    input           clk,
+    input   [2*dataWidth-1:0]   x,
+    output  reg [dataWidth-1:0]  out
+);
+
+
+always @(posedge clk)
+begin
+    if($signed(x) >= 0)
+    begin
+        if(|x[2*dataWidth-1-:weightIntWidth+1]) //over flow to sign bit of integer part
+            out <= {1'b0,{(dataWidth-1){1'b1}}}; //positive saturate
+        else
+            out <= x[2*dataWidth-1-weightIntWidth-:dataWidth];
+    end
+    else 
+        out <= 0;      
+end
+
+endmodule
+
+
+testbench file:
+
+
+`include "..\rtl\include.v"
+
+`define MaxTestSamples 100
+
+module top_sim(
+
+    );
+    
+    reg reset;
+    reg clock;
+    reg [`dataWidth-1:0] in;
+    reg in_valid;
+    reg [`dataWidth-1:0] in_mem [784:0];
+    reg [7:0] fileName[23:0];
+    reg s_axi_awvalid;
+    reg [31:0] s_axi_awaddr;
+    wire s_axi_awready;
+    reg [31:0] s_axi_wdata;
+    reg s_axi_wvalid;
+    wire s_axi_wready;
+    wire s_axi_bvalid;
+    reg s_axi_bready;
+    wire intr;
+    reg [31:0] axiRdData;
+    reg [31:0] s_axi_araddr;
+    wire [31:0] s_axi_rdata;
+    reg s_axi_arvalid;
+    wire s_axi_arready;
+    wire s_axi_rvalid;
+    reg s_axi_rready;
+    reg [`dataWidth-1:0] expected;
+
+    wire [31:0] numNeurons[31:1];
+    wire [31:0] numWeights[31:1];
+    
+    assign numNeurons[1] = 30;
+    assign numNeurons[2] = 30;
+    assign numNeurons[3] = 10;
+    assign numNeurons[4] = 10;
+    
+    assign numWeights[1] = 784;
+    assign numWeights[2] = 30;
+    assign numWeights[3] = 30;
+    assign numWeights[4] = 10;
+    
+    integer right=0;
+    integer wrong=0;
+    
+    zyNet dut(
+    .s_axi_aclk(clock),
+    .s_axi_aresetn(reset),
+    .s_axi_awaddr(s_axi_awaddr),
+    .s_axi_awprot(0),
+    .s_axi_awvalid(s_axi_awvalid),
+    .s_axi_awready(s_axi_awready),
+    .s_axi_wdata(s_axi_wdata),
+    .s_axi_wstrb(4'hF),
+    .s_axi_wvalid(s_axi_wvalid),
+    .s_axi_wready(s_axi_wready),
+    .s_axi_bresp(),
+    .s_axi_bvalid(s_axi_bvalid),
+    .s_axi_bready(s_axi_bready),
+    .s_axi_araddr(s_axi_araddr),
+    .s_axi_arprot(0),
+    .s_axi_arvalid(s_axi_arvalid),
+    .s_axi_arready(s_axi_arready),
+    .s_axi_rdata(s_axi_rdata),
+    .s_axi_rresp(),
+    .s_axi_rvalid(s_axi_rvalid),
+    .s_axi_rready(s_axi_rready),
+    .axis_in_data(in),
+    .axis_in_data_valid(in_valid),
+    .axis_in_data_ready(),
+    .intr(intr)
+    );
+    
+            
+    initial
+    begin
+        clock = 1'b0;
+        s_axi_awvalid = 1'b0;
+        s_axi_bready = 1'b0;
+        s_axi_wvalid = 1'b0;
+        s_axi_arvalid = 1'b0;
+    end
+        
+    always
+        #5 clock = ~clock;
+    
+    function [7:0] to_ascii;
+      input integer a;
+      begin
+        to_ascii = a+48;
+      end
+    endfunction
+    
+    always @(posedge clock)
+    begin
+        s_axi_bready <= s_axi_bvalid;
+        s_axi_rready <= s_axi_rvalid;
+    end
+    
+    task writeAxi(
+    input [31:0] address,
+    input [31:0] data
+    );
+    begin
+        @(posedge clock);
+        s_axi_awvalid <= 1'b1;
+        s_axi_awaddr <= address;
+        s_axi_wdata <= data;
+        s_axi_wvalid <= 1'b1;
+        wait(s_axi_wready);
+        @(posedge clock);
+        s_axi_awvalid <= 1'b0;
+        s_axi_wvalid <= 1'b0;
+        @(posedge clock);
+    end
+    endtask
+    
+    task readAxi(
+    input [31:0] address
+    );
+    begin
+        @(posedge clock);
+        s_axi_arvalid <= 1'b1;
+        s_axi_araddr <= address;
+        wait(s_axi_arready);
+        @(posedge clock);
+        s_axi_arvalid <= 1'b0;
+        wait(s_axi_rvalid);
+        @(posedge clock);
+        axiRdData <= s_axi_rdata;
+        @(posedge clock);
+    end
+    endtask
+    
+    task configWeights();
+    integer i,j,k,t;
+    integer neuronNo_int;
+    reg [`dataWidth:0] config_mem [783:0];
+    begin
+        @(posedge clock);
+        for(k=1;k<=`numLayers;k=k+1)
+        begin
+            writeAxi(12,k);//Write layer number
+            for(j=0;j<numNeurons[k];j=j+1)
+            begin
+                neuronNo_int = j;
+                fileName[0] = "f";
+                fileName[1] = "i";
+                fileName[2] = "m";
+                fileName[3] = ".";
+                if(j > 9)
+                begin
+                    fileName[4] = 48;
+                    fileName[5] = 48;
+                    i=0;
+                    while(neuronNo_int != 0)
+                    begin
+                        fileName[i+4] = to_ascii(neuronNo_int%10);
+                        neuronNo_int = neuronNo_int/10;
+                        i=i+1;
+                    end 
+                    fileName[6] = "_";
+                    fileName[7] = to_ascii(k);
+                    fileName[8] = "_";
+                    fileName[9] = "w";
+                end
+                else
+                begin
+                    fileName[4] = 48;
+                    i=0;
+                    while(neuronNo_int != 0)
+                    begin
+                        fileName[i+4] = to_ascii(neuronNo_int%10);
+                        neuronNo_int = neuronNo_int/10;
+                        i=i+1;
+                    end 
+                    fileName[5] = "_";
+                    fileName[6] = to_ascii(k);
+                    fileName[7] = "_";
+                    fileName[8] = "w";
+                end
+                $readmemb(fileName, config_mem);
+                writeAxi(16,j);//Write neuron number
+                for (t=0; t<numWeights[k]; t=t+1) begin
+                    writeAxi(0,{15'd0,config_mem[t]});
+                end 
+            end
+        end
+    end
+    endtask
+    
+    task configBias();
+    integer i,j,k,t;
+    integer neuronNo_int;
+    reg [31:0] bias[0:0];
+    begin
+        @(posedge clock);
+        for(k=1;k<=`numLayers;k=k+1)
+        begin
+            writeAxi(12,k);//Write layer number
+            for(j=0;j<numNeurons[k];j=j+1)
+            begin
+                neuronNo_int = j;
+                fileName[0] = "f";
+                fileName[1] = "i";
+                fileName[2] = "m";
+                fileName[3] = ".";
+                if(j>9)
+                begin
+                    fileName[4] = 48;
+                    fileName[5] = 48;
+                    i=0;
+                    while(neuronNo_int != 0)
+                    begin
+                        fileName[i+4] = to_ascii(neuronNo_int%10);
+                        neuronNo_int = neuronNo_int/10;
+                        i=i+1;
+                    end 
+                    fileName[6] = "_";
+                    fileName[7] = to_ascii(k);
+                    fileName[8] = "_";
+                    fileName[9] = "b";
+                end
+                else
+                begin
+                    fileName[4] = 48;
+                    i=0;
+                    while(neuronNo_int != 0)
+                    begin
+                        fileName[i+4] = to_ascii(neuronNo_int%10);
+                        neuronNo_int = neuronNo_int/10;
+                        i=i+1;
+                    end 
+                    fileName[5] = "_";
+                    fileName[6] = to_ascii(k);
+                    fileName[7] = "_";
+                    fileName[8] = "b";               
+                end
+                $readmemb(fileName, bias);
+                writeAxi(16,j);//Write neuron number
+                writeAxi(4,{15'd0,bias[0]});
+            end
+        end
+    end
+    endtask
+    
+    
+    task sendData();
+    //input [25*7:0] fileName;
+    integer t;
+    begin
+        $readmemb(fileName, in_mem);
+        @(posedge clock);
+        @(posedge clock);
+        @(posedge clock);
+        for (t=0; t <784; t=t+1) begin
+            @(posedge clock);
+            in <= in_mem[t];
+            in_valid <= 1;
+            //@(posedge clock);
+            //in_valid <= 0;
+        end 
+        @(posedge clock);
+        in_valid <= 0;
+        expected = in_mem[t];
+    end
+    endtask
+   
+    integer i,j,layerNo=1,k;
+    integer start;
+    integer testDataCount;
+    integer testDataCount_int;
+    initial
+    begin
+        reset = 0;
+        in_valid = 0;
+        #100;
+        reset = 1;
+        #100
+        writeAxi(28,0);//clear soft reset
+        start = $time;
+        `ifndef pretrained
+            configWeights();
+            configBias();
+        `endif
+        $display("Configuration completed",,,,$time-start,,"ns");
+        start = $time;
+        for(testDataCount=0;testDataCount<`MaxTestSamples;testDataCount=testDataCount+1)
+        begin
+            testDataCount_int = testDataCount;
+            fileName[0] = "t";
+            fileName[1] = "x";
+            fileName[2] = "t";
+            fileName[3] = ".";
+            fileName[4] = "0";
+            fileName[5] = "0";
+            fileName[6] = "0";
+            fileName[7] = "0";
+            i=0;
+            while(testDataCount_int != 0)
+            begin
+                fileName[i+4] = to_ascii(testDataCount_int%10);
+                testDataCount_int = testDataCount_int/10;
+                i=i+1;
+            end 
+            fileName[8] = "_";
+            fileName[9] = "a";
+            fileName[10] = "t";
+            fileName[11] = "a";
+            fileName[12] = "d";
+            fileName[13] = "_";
+            fileName[14] = "t";
+            fileName[15] = "s";
+            fileName[16] = "e";
+            fileName[17] = "t";
+            sendData();
+            @(posedge intr);
+            //readAxi(24);
+            //$display("Status: %0x",axiRdData);
+            readAxi(8);
+            if(axiRdData==expected)
+                right = right+1;
+            $display("%0d. Accuracy: %f, Detected number: %0x, Expected: %x",testDataCount+1,right*100.0/(testDataCount+1),axiRdData,expected);
+            /*$display("Total execution time",,,,$time-start,,"ns");
+            j=0;
+            repeat(10)
+            begin
+                readAxi(20);
+                $display("Output of Neuron %d: %0x",j,axiRdData);
+                j=j+1;
+            end*/
+        end
+        $display("Accuracy: %f",right*100.0/testDataCount);
+        $stop;
+    end
+
+
+endmodule
+
+
+C program file:
+
+#include "dataValues.h"
+#include "xaxidma.h"
+#include "xparameters.h"
+#include "xil_cache.h"
+#include "xscugic.h"
+#include "sleep.h"
+
+XScuGic IntcInstance;
+XAxiDma myDma;
+
+int done=0;
+
+static void nnISR();
+
+int main(){
+	u32 status;
+	u32 detectedDigit;
+
+	XAxiDma_Config *myDmaConfig;
+
+	myDmaConfig = XAxiDma_LookupConfigBaseAddr(XPAR_AXI_DMA_0_BASEADDR);
+	status = XAxiDma_CfgInitialize(&myDma, myDmaConfig);
+	if(status != XST_SUCCESS){
+		print("DMA Initialization failed \n");
+		return -1;
+	}
+
+	XScuGic_Config *IntcConfig;
+	IntcConfig = XScuGic_LookupConfig(XPAR_PS7_SCUGIC_0_DEVICE_ID);
+	status = XScuGic_CfgInitialize(&IntcInstance, IntcConfig, IntcConfig->CpuBaseAddress);
+	if(status != XST_SUCCESS){
+		xil_printf("Interrupt Controller Initialization failed \n");
+		return -1;
+	}
+
+	XScuGic_SetPriorityTriggerType(&IntcInstance, XPAR_FABRIC_ZYNET_0_INTR_INTR, 0xA0, 3);
+	status = XScuGic_Connect(&IntcInstance, XPAR_FABRIC_ZYNET_0_INTR_INTR, (Xil_InterruptHandler)nnISR, 0);
+	if(status != XST_SUCCESS){
+			xil_printf("Interrupt Connection failed \n");
+			return -1;
+	}
+	XScuGic_Enable(&IntcInstance, XPAR_FABRIC_ZYNET_0_INTR_INTR);
+	Xil_ExceptionInit();
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,(Xil_ExceptionHandler)XScuGic_InterruptHandler, (void *)&IntcInstance);
+	Xil_ExceptionEnable();
+
+	status = XAxiDma_SimpleTransfer(&myDma, (u32)dataValues, 28*28, XAXIDMA_DMA_TO_DEVICE);
+	if(status != XST_SUCCESS){
+		print("DMA Initialization failed \n");
+		return -1;
+	}
+
+	while(!done);
+
+	detectedDigit = Xil_In32(XPAR_ZYNET_0_BASEADDR+8);
+
+	xil_printf("Detected Number %d Expected Number %d\n\r",detectedDigit,result);
+
+}
+
+static void nnISR(){
+	done = 1;
+	Xil_In32(XPAR_ZYNET_0_BASEADDR+24);
+}
